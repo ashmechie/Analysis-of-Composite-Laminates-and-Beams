@@ -1,5 +1,7 @@
-%% Final main script: progressive failure (zero stiffness), store R at failure per ply,
-% then pick the maximum of those stored R's to compute critical loads.
+%% ------------------------------------------------------------------
+% Progressive failure analysis (zero stiffness) for laminates
+% Only prints final summary table of R_fail per ply
+% ------------------------------------------------------------------
 
 clc; clear; close all;
 
@@ -65,6 +67,7 @@ loads = inputLoads();
 if numel(loads) ~= 6
     error('inputLoads must return a 6-element column vector [Nx;Ny;Nxy;Mx;My;Mxy].');
 end
+loads = loads(:); % ensure column
 load_names = {'Nx','Ny','Nxy','Mx','My','Mxy'};
 
 %% ---------- Tsai-Wu coeffs ----------
@@ -81,12 +84,7 @@ if ndims(Qbar_all) == 2
 end
 
 [A, B, D, ABD] = calcABD(Qbar_all, theta_deg, t);
-Exx = (A(1,1)/h_total) * (1 - (A(1,2)^2)/(A(1,1)*A(2,2)));
-fprintf('\nEffective Exx of laminate = %.6e psi\n', Exx);
 
-% ---- NEW: Compute effective laminate Gxy ----
-Gxy_eff = A(3,3) / h_total;
-fprintf('Effective Gxy of laminate = %.6e psi\n', Gxy_eff);
 if rcond(ABD) < 1e-14
     error('Full-laminate ABD is singular or ill-conditioned.');
 end
@@ -95,153 +93,12 @@ strain_curvature = ABD \ loads;
 eps0 = strain_curvature(1:3);
 kappa = strain_curvature(4:6);
 
-%% ---------- Compute and Display Ply Stresses/Strains (Local) ----------
-eps_local_all = zeros(3,n);
-sig_local_all = zeros(3,n);
+%% ---------- Call the failure-computation function ----------
+[R_initial, R_fail_at_ply, failure_order] = computeInitialAndProgressiveFailure( ...
+        n, theta_deg, z_mid, z_interfaces, Q, Qbar_all, ...
+        F1, F2, F11, F22, F66, F12, loads, eps0, kappa);
 
-for i = 1:n
-    strain_global = eps0 + z_mid(i) * kappa;
-    Tcap = Tcapmatrix(theta_deg(i));
-    eps_local_all(:,i) = Tcap * strain_global;
-    sig_local_all(:,i) = Q * eps_local_all(:,i);
-end
-
-
-%% ---------- Initial R-values ----------
-R_initial = NaN(n,1);
-for i = 1:n
-    s11 = sig_local_all(1,i)/1000;
-    s22 = sig_local_all(2,i)/1000;
-    t12 = sig_local_all(3,i)/1000;
-
-    Acoef = F11*s11^2 + 2*F12*s11*s22 + F22*s22^2 + F66*t12^2;
-    Bcoef = F1*s11 + F2*s22;
-    Ccoef = -1;
-    disc = Bcoef^2 - 4*Acoef*Ccoef;
-    if disc >= 0
-        R1 = (-Bcoef + sqrt(disc)) / (2*Acoef);
-        R2 = (-Bcoef - sqrt(disc)) / (2*Acoef);
-        R_initial(i) = max([R1,R2,0]);
-    else
-        R_initial(i) = NaN;
-    end
-end
-
-fprintf('\nInitial R-values (full laminate):\n');
-disp(table((1:n)', theta_deg', z_mid, R_initial, ...
-    'VariableNames', {'Ply_Number','Angle_deg','z_mid_in','R_initial'}));
-
-%% ---------- Progressive Failure Loop (NO per-iteration tables) ----------
-active = true(n,1);
-R_fail_at_ply = NaN(n,1);
-failure_order = [];     % track order of failures
-iteration = 1;
-tol = 1e-9;
-
-fprintf('\nStarting progressive failure loop...\n');
-
-while true
-    % Apply zero stiffness to failed plies
-    Qbar_mod = zeros(3,3,n);
-    for i = 1:n
-        if active(i)
-            Qbar_mod(:,:,i) = Qbar_all(:,:,i);
-        else
-            Qbar_mod(:,:,i) = zeros(3);
-        end
-    end
-    
-    % Recompute ABD
-    A = zeros(3); B = zeros(3); D = zeros(3);
-    for i = 1:n
-        z1 = z_interfaces(i); z2 = z_interfaces(i+1);
-        Qb = Qbar_mod(:,:,i);
-        A = A + Qb * (z2 - z1);
-        B = B + 0.5 * Qb * (z2^2 - z1^2);
-        D = D + (1/3) * Qb * (z2^3 - z1^3);
-    end
-    ABD = [A B; B D];
-    
-    if rcond(ABD) < 1e-12
-        warning('ABD singular or nearly singular. Stopping progressive failure loop.');
-        break;
-    end
-    
-    strain_curvature = ABD \ loads;
-    eps0 = strain_curvature(1:3);
-    kappa = strain_curvature(4:6);
-    
-    % --- Compute new R-values
-    R_iter = NaN(n,1);
-    for i = 1:n
-        strain_global = eps0 + z_mid(i) * kappa;
-        Tcap = Tcapmatrix(theta_deg(i));
-        strain_local = Tcap * strain_global;
-        stress_local = Q * strain_local;
-        
-        s11 = stress_local(1)/1000;
-        s22 = stress_local(2)/1000;
-        t12 = stress_local(3)/1000;
-        Acoef = F11*s11^2 + 2*F12*s11*s22 + F22*s22^2 + F66*t12^2;
-        Bcoef = F1*s11 + F2*s22;
-        Ccoef = -1;
-        disc = Bcoef^2 - 4*Acoef*Ccoef;
-        if disc >= 0
-            R1 = (-Bcoef + sqrt(disc)) / (2*Acoef);
-            R2 = (-Bcoef - sqrt(disc)) / (2*Acoef);
-            R_iter(i) = max([R1,R2,0]);
-        end
-    end
-    
-    % --- Identify ply to fail
-    active_indices = find(active);
-    active_Rs = R_iter(active_indices);
-    valid_mask = ~isnan(active_Rs);
-    if ~any(valid_mask)
-        fprintf('No valid R among active plies. Stopping.\n');
-        break;
-    end
-    
-    minR = min(active_Rs(valid_mask));
-    to_fail_mask = (R_iter <= minR + tol) & active;
-    to_fail_indices = find(to_fail_mask);
-    if isempty(to_fail_indices)
-        fprintf('No plies identified to fail this iteration. Stopping.\n');
-        break;
-    end
-    
-    % --- Store failure info
-    for idx = to_fail_indices'
-        R_fail_at_ply(idx) = minR;
-        failure_order = [failure_order; iteration, idx, minR];
-    end
-    
-    % Mark ply(s) as failed
-    active(to_fail_indices) = false;
-    
-    % End condition
-    if ~any(active)
-        fprintf('All plies have failed. End of progressive failure.\n');
-        break;
-    end
-    
-    iteration = iteration + 1;
-end
-
-%% ---------- Ply Failure Order Summary (NEW TABLE) ----------
-if ~isempty(failure_order)
-    fprintf('\n=============================================\n');
-    fprintf('Ply Failure Order Summary:\n');
-    FailureSummary = array2table(failure_order, ...
-        'VariableNames', {'Iteration','Ply_Number','R_fail'});
-    disp(FailureSummary);
-else
-    fprintf('\nNo ply failures recorded.\n');
-end
-fprintf('=============================================\n');
-
-
-%% ---------- Post-Failure Analysis ----------
+%% ---------- Post-Failure Analysis (summary only) ----------
 if all(isnan(R_fail_at_ply))
     error('No ply failure records were captured (R_fail_at_ply all NaN).');
 end
@@ -268,107 +125,47 @@ for k = 1:6
     end
 end
 fprintf('=============================================\n');
-%% ---------- Compute and Display Ply Stresses/Strains (Local & Global) ----------
-eps_local_all = zeros(3,n);
-sig_local_all = zeros(3,n);
-eps_global_all = zeros(3,n);
-sig_global_all = zeros(3,n);
+%% ---------- Stress and Strain Plotting ----------
+% Calculate stresses and strains for each ply based on INITIAL state
+% (Before progressive degradation)
+z_plot = linspace(-h_total/2, h_total/2, 100);
+stress_plot = zeros(length(z_plot), 3);
+strain_plot = zeros(length(z_plot), 3);
 
-fprintf('\nPly-wise Local Strains and Stresses (before R-value calculation):\n');
-fprintf('-------------------------------------------------------------------------------------------------------------\n');
-fprintf('Ply |  Angle(deg) |        ε1            ε2            γ12      |        σ1 (psi)        σ2 (psi)        τ12 (psi)\n');
-fprintf('-------------------------------------------------------------------------------------------------------------\n');
-
-for i = 1:n
-    % ---- Global strain (εx, εy, γxy) ----
-    strain_global = eps0 + z_mid(i) * kappa;
-    eps_global_all(:,i) = strain_global;
-
-    % ---- Transform to local coordinates ----
-    Tcap = Tcapmatrix(theta_deg(i));
-    eps_local_all(:,i) = Tcap * strain_global;
-    sig_local_all(:,i) = Q * eps_local_all(:,i);
-
-    % ---- Compute global stresses (σx, σy, τxy) ----
-    % Note: use transformation from local to global
-    Tinv = inv(Tcap);   % since [ε_local] = [Tcap]*[ε_global]
-    sig_global_all(:,i) = Tinv' * sig_local_all(:,i);  
-
-    % ---- Print local values ----
-    fprintf('%3d | %10.2f | %12.6e %12.6e %12.6e | %14.3f %14.3f %14.3f\n', ...
-        i, theta_deg(i), ...
-        eps_local_all(1,i), eps_local_all(2,i), eps_local_all(3,i), ...
-        sig_local_all(1,i), sig_local_all(2,i), sig_local_all(3,i));
-end
-fprintf('-------------------------------------------------------------------------------------------------------------\n');
-
-%% ---------- NEW: Display Global Strains and Stresses Table ----------
-fprintf('\nPly-wise Global Strains and Stresses (x-y coordinates):\n');
-fprintf('-------------------------------------------------------------------------------------------------------------\n');
-fprintf('Ply |  Angle(deg) |        εx            εy            γxy      |        σx (psi)        σy (psi)        τxy (psi)\n');
-fprintf('-------------------------------------------------------------------------------------------------------------\n');
-
-for i = 1:n
-    fprintf('%3d | %10.2f | %12.6e %12.6e %12.6e | %14.3f %14.3f %14.3f\n', ...
-        i, theta_deg(i), ...
-        eps_global_all(1,i), eps_global_all(2,i), eps_global_all(3,i), ...
-        sig_global_all(1,i), sig_global_all(2,i), sig_global_all(3,i));
-end
-fprintf('-------------------------------------------------------------------------------------------------------------\n');
-
-%% ---------- PLOTTING STRESSES AND STRAINS (SUBPLOTS) ----------
-z_plot = [];
-strains_plot = []; 
-stresses_plot = []; 
-
-for i = 1:n
-    z_top = z_interfaces(i);
-    z_bot = z_interfaces(i+1);
+for i = 1:length(z_plot)
+    z = z_plot(i);
+    % Find which ply this z belongs to
+    ply_idx = find(z <= z_interfaces(2:end), 1, 'first');
+    if isempty(ply_idx), ply_idx = n; end
     
-    % Using initial Qbar_all for these plots
-    Qb = Qbar_all(:,:,i); 
+    % Global Strain at height z: eps = eps0 + z * kappa
+    eps_z = eps0 + z * kappa;
+    strain_plot(i, :) = eps_z';
     
-    z_points = [z_top, z_bot];
-    for zp = z_points
-        eps_g = eps0 + zp * kappa;
-        sig_g = Qb * eps_g;
-        
-        z_plot = [z_plot; zp];
-        strains_plot = [strains_plot; eps_g'];
-        stresses_plot = [stresses_plot; sig_g'];
-    end
+    % Global Stress at height z: sigma = Qbar * eps
+    % Note: Using the original Qbar_all for initial stress state
+    sigma_z = Qbar_all(:,:,ply_idx) * eps_z;
+    stress_plot(i, :) = sigma_z';
 end
 
-% --- Figure 1: Global Strains Subplots ---
-figure('Color', 'w', 'Name', 'Global Strains Breakdown', 'Position', [100, 100, 1000, 400]);
+% Create Figure for Strains
+figure('Name', 'Laminate Strain Distribution', 'NumberTitle', 'off');
+labels = {'\epsilon_{xx}', '\epsilon_{yy}', '\gamma_{xy}'};
+for i = 1:3
+    subplot(3,1,i)
+    plot(strain_plot(:,i), z_plot, 'b', 'LineWidth', 1.5)
+    grid on; ylabel('z (in)'); xlabel(labels{i});
+    title(['Global Strain ', labels{i}]);
+end
 
-subplot(1,3,1);
-plot(strains_plot(:,1), z_plot, 'r', 'LineWidth', 2); grid on;
-title('\epsilon_x (Normal X)'); ylabel('z (in)'); xlabel('Strain');
+% Create Figure for Stresses
+figure('Name', 'Laminate Stress Distribution', 'NumberTitle', 'off');
+labels_sig = {'\sigma_{xx}', '\sigma_{yy}', '\tau_{xy}'};
+for i = 1:3
+    subplot(3,1,i)
+    plot(stress_plot(:,i), z_plot, 'r', 'LineWidth', 1.5)
+    grid on; ylabel('z (in)'); xlabel(labels_sig{i});
+    title(['Global Stress ', labels_sig{i}]);
+end
 
-subplot(1,3,2);
-plot(strains_plot(:,2), z_plot, 'b', 'LineWidth', 2); grid on;
-title('\epsilon_y (Normal Y)'); xlabel('Strain');
 
-subplot(1,3,3);
-plot(strains_plot(:,3), z_plot, 'g', 'LineWidth', 2); grid on;
-title('\gamma_{xy} (Shear)'); xlabel('Strain');
-
-sgtitle('Global Strains Through Thickness');
-
-% --- Figure 2: Global Stresses Subplots ---
-figure('Color', 'w', 'Name', 'Global Stresses Breakdown', 'Position', [100, 550, 1000, 400]);
-
-subplot(1,3,1);
-plot(stresses_plot(:,1), z_plot, 'r', 'LineWidth', 2); grid on;
-title('\sigma_x (Normal X)'); ylabel('z (in)'); xlabel('Stress (psi)');
-
-subplot(1,3,2);
-plot(stresses_plot(:,2), z_plot, 'b', 'LineWidth', 2); grid on;
-title('\sigma_y (Normal Y)'); xlabel('Stress (psi)');
-
-subplot(1,3,3);
-plot(stresses_plot(:,3), z_plot, 'g', 'LineWidth', 2); grid on;
-title('\tau_{xy} (Shear)'); xlabel('Stress (psi)');
-
-sgtitle('Global Stresses Through Thickness');
